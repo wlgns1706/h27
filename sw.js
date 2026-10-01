@@ -1,6 +1,6 @@
 // Offline store for the phone app. build_pwa.mjs puts a hash of the app shell into BUILD (the only
 // place its placeholder may appear), so a new shell installs a new worker. strategyFor() decides how each request is answered.
-const BUILD = 'f57a4b4092f9';
+const BUILD = '65f6f47fd54f';
 const CACHE = 'h27-' + BUILD;
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 const DATA = 'data.enc';
@@ -17,21 +17,38 @@ function strategyFor(url, scope) {
   return 'network';
 }
 
-// The trip data: always try the network first (bypassing the HTTP cache), keep what arrives,
-// and fall back to the kept copy, marked with x-h27-cache: hit so the page can say it is offline.
-async function networkFirst(request) {
+const NETWORK_WAIT_MS = 4000;
+
+// The trip data: try the network first (bypassing the HTTP cache) and keep what arrives. If it fails,
+// or a weak signal keeps it hanging past waitMs while a copy is kept, answer with the kept copy,
+// marked with x-h27-cache: hit so the page can say it is offline. A late network answer still updates the copy.
+async function networkFirst(request, waitMs = NETWORK_WAIT_MS) {
   const cache = await caches.open(CACHE);
-  try {
-    const res = await fetch(request, { cache: 'no-store' });
+  const network = fetch(request, { cache: 'no-store' }).then(async res => {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     await cache.put(DATA, res.clone());
     return res;
-  } catch (err) {
+  });
+  network.catch(() => {});
+  const keptCopy = async () => {
     const kept = await cache.match(DATA);
-    if (!kept) throw err;
+    if (!kept) return null;
     const headers = new Headers(kept.headers);
     headers.set('x-h27-cache', 'hit');
     return new Response(await kept.blob(), { status: 200, headers });
+  };
+  let timer;
+  const slow = new Promise(resolve => { timer = setTimeout(resolve, waitMs, 'slow'); });
+  try {
+    const first = await Promise.race([network, slow]);
+    if (first !== 'slow') return first;
+    return (await keptCopy()) || (await network);
+  } catch (err) {
+    const kept = await keptCopy();
+    if (!kept) throw err;
+    return kept;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -67,8 +84,14 @@ async function carryOver() {
 }
 
 if (typeof self !== 'undefined' && self.addEventListener) {
+  // The shell bypasses the HTTP cache (Pages keeps files 10 minutes), so a new worker never stores an
+  // old page. The trip data is kept too, best effort, because the first visit's own fetch happens before
+  // this worker controls the page.
   self.addEventListener('install', e => {
-    e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+    const fresh = u => new Request(new URL(u, self.registration.scope), { cache: 'reload' });
+    e.waitUntil(caches.open(CACHE)
+      .then(c => c.addAll(SHELL.map(fresh)).then(() => c.add(fresh(DATA)).catch(() => {})))
+      .then(() => self.skipWaiting()));
   });
   self.addEventListener('activate', e => {
     e.waitUntil(carryOver().then(() => self.clients.claim()));

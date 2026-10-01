@@ -569,6 +569,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outlin
 .lock-card p { color: var(--sub); font-size: 14px; margin: 0 0 18px; }
 .lock-card input { width: 100%; box-sizing: border-box; font: inherit; font-size: 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--ink); }
 .lock-card button { margin-top: 12px; width: 100%; font: inherit; font-weight: 700; padding: 12px; border: 0; border-radius: 12px; background: var(--accent); color: #fff; }
+.lock-card button[hidden] { display: none; }
 .lock-msg { min-height: 20px; margin-top: 12px; font-size: 14px; color: var(--warn-fg); }
 .lock-out { margin-left: 8px; font: inherit; color: var(--sub); background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }
 </style>
@@ -582,6 +583,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outlin
       <button type="submit">열기</button>
     </form>
     <div class="lock-msg" id="lock-msg" role="status">여는 중…</div>
+    <button id="lock-retry" type="button" hidden>다시 시도</button>
   </div>
 </div>
 <script id="pwa-loader">(function () {
@@ -636,31 +638,51 @@ async function decrypt(envelope, key) {
 const WRONG = '비밀번호가 맞지 않아요';
 const NEED_NETWORK = '처음 한 번은 인터넷 연결이 필요해요';
 const OFFLINE_NOTE = '오프라인 — 마지막 반영본';
+const BROKEN = '문제가 생겼어요. 다시 시도해 주세요';
 
 async function tryOpen(envelope, key) {
   try { return await decrypt(envelope, key); } catch { return null; }
 }
 
+// Any unexpected error (e.g. a damaged saved copy) ends in fail(BROKEN), which offers a retry,
+// instead of leaving the lock screen on "여는 중…".
 async function openTrip(deps) {
-  const got = await deps.loadEnvelope();
-  if (!got) return deps.fail(NEED_NETWORK);
-  const { envelope, offline } = got;
-  const stored = await deps.keys.get();
-  if (stored) {
-    const json = await tryOpen(envelope, stored);
-    if (json !== null) return deps.run(json, { offline });
-    await deps.keys.clear();
-  }
-  let message = '';
-  for (;;) {
-    const pass = (await deps.ask(message)).trim();
-    const key = await deriveKey(pass, envelope.salt, envelope.iter);
-    const json = await tryOpen(envelope, key);
-    if (json !== null) {
-      await deps.keys.set(key);
-      return deps.run(json, { offline });
+  let got;
+  try {
+    got = await deps.loadEnvelope();
+    if (!got) return deps.fail(NEED_NETWORK);
+    const { envelope, offline } = got;
+    const info = { offline, built: envelope.built };
+    const stored = await deps.keys.get();
+    if (stored) {
+      const json = await tryOpen(envelope, stored);
+      if (json !== null) return deps.run(json, info);
+      await deps.keys.clear();
     }
-    message = WRONG;
+    let message = '';
+    for (;;) {
+      const pass = (await deps.ask(message)).trim();
+      const key = await deriveKey(pass, envelope.salt, envelope.iter);
+      const json = await tryOpen(envelope, key);
+      if (json !== null) {
+        await deps.keys.set(key);
+        return deps.run(json, info);
+      }
+      message = WRONG;
+    }
+  } catch {
+    return deps.fail(BROKEN);
+  }
+}
+
+// A phone keeps the app open for days: when it comes back into view, check whether newer data
+// is online (not just the kept copy) so the page can reload into it.
+async function hasNewData(loadEnvelope, built) {
+  try {
+    const got = await loadEnvelope();
+    return !!got && !got.offline && got.envelope.built !== built;
+  } catch {
+    return false;
   }
 }
 
@@ -698,14 +720,16 @@ function startInBrowser() {
   const $ = id => document.getElementById(id);
   const keys = idbKeys();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  async function loadEnvelope() {
+    try {
+      const res = await fetch('./data.enc', { cache: 'no-store' });
+      if (!res.ok) return null;
+      return { envelope: await res.json(), offline: res.headers.get('x-h27-cache') === 'hit' };
+    } catch { return null; }
+  }
+  $('lock-retry').onclick = () => location.reload();
   openTrip({
-    async loadEnvelope() {
-      try {
-        const res = await fetch('./data.enc', { cache: 'no-store' });
-        if (!res.ok) return null;
-        return { envelope: await res.json(), offline: res.headers.get('x-h27-cache') === 'hit' };
-      } catch { return null; }
-    },
+    loadEnvelope,
     keys,
     ask(message) {
       $('lock').hidden = false;
@@ -721,9 +745,12 @@ function startInBrowser() {
         };
       });
     },
-    run(json, { offline }) {
+    run(json, { offline, built }) {
       $('lock').hidden = true;
       runDeferred(document, json);
+      document.addEventListener('visibilitychange', async () => {
+        if (!document.hidden && await hasNewData(loadEnvelope, built)) location.reload();
+      });
       const foot = $('foot');
       if (offline) foot.append(' · ' + OFFLINE_NOTE);
       const out = document.createElement('button');
@@ -737,6 +764,7 @@ function startInBrowser() {
       $('lock').hidden = false;
       $('lock-form').hidden = true;
       $('lock-msg').textContent = message;
+      $('lock-retry').hidden = false;
     },
   });
 }
